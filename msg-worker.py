@@ -1,43 +1,25 @@
-from flask import Flask, request, jsonify, make_response
-from spacy.pipeline import EntityRecognizer
-from spacytextblob.spacytextblob import SpacyTextBlob
-from flask_cors import CORS
+import json
+import pika, sys,os
 import spacy
-import time
+from spacytextblob.spacytextblob import SpacyTextBlob
+import requests
 import numpy as np
-
-app = Flask(__name__)
-
-cors = CORS()
+from dotenv import load_dotenv
+load_dotenv()
+NEXT_URL = os.environ.get("NEXT_URL")
+print("nexty", NEXT_URL)
 
 nlp = spacy.load("en_core_web_trf")
 nlp.add_pipe("spacytextblob")
-
-
-
-print("Loaded")
-
-
-@app.route("/tasks/NER", methods=["POST"])
-def nerRoute():
-    data = request.json["data"]
-    print(data)
-
-    out = {}
-
+def ner_task(data: list):
+    out = {} 
     for file in data:
-        text = file["file"]["text"]
-        doc = nlp(text)
-        out[file["file"]["id"]] = {"data": [{"text": ent.text, "label": ent.label_} for ent in doc.ents]}
-    print(out)
-    res = make_response(jsonify(out))
-    res.headers["Content-Type"] = "application/json"
-    # time.sleep(10)
-    return res
-
-@app.route("/tasks/Sentiment", methods=["POST"])
-def sentimentRoute():
-    files = request.json["data"]
+                text = file["file"]["text"]
+                doc = nlp(text)
+                out[file["file"]["id"]] = {"data": [{"text": ent.text, "label": ent.label_} for ent in doc.ents]}
+    return out
+def sentiment_task(data: list):
+    files = data
     print("FILES", files)
     ids = [file["fileID"] for file in files]
     docs = [nlp(file["file"]["text"]) for file in files]
@@ -50,11 +32,7 @@ def sentimentRoute():
             "pos_words": [each[0][0] for each in doc._.blob.sentiment_assessments.assessments if each[1] > 0],
             "neg_words": [each[0][0] for each in doc._.blob.sentiment_assessments.assessments if each[1] < 0]
             }
-    res = make_response(jsonify(out))
-    res.headers["Content-Type"] = "application/json"
-    print(res)
-    return res
-
+    return out 
 
 def similarity(doc ,other_doc):
     a = np.mean(doc._.trf_data.tensors[1], axis=0)
@@ -65,17 +43,8 @@ def similarity(doc ,other_doc):
     print(res)
     assert(res <= 1.0)
     return res.item()
-
-    print("SIMILARITY TENSOR")
-    print(doc._.trf_data.tensors[0].shape)
-    print(other_doc._.trf_data.tensors[0].shape)
-
-    print(doc._.trf_data.tensors[1].shape)
-    print(other_doc._.trf_data.tensors[1].shape)
-
-@app.route("/tasks/Similarity", methods=["POST"])
-def similarityRoute():
-    files = request.json["data"]
+def similarity_task(data:list):
+    files = data
     print("FILES",files)
     ids = [file["fileID"] for file in files]
     names = {file["fileID"]: file["file"]["name"] for file in files}
@@ -132,18 +101,69 @@ def similarityRoute():
 
 
         out[ids[ix]] = similarities
-    print(out)
-    res = make_response(jsonify(out))
-    res.headers["Content-Type"] = "application/json"
-    return res
+    
+    return out
 
+
+
+    
+
+def main():
+
+
+
+    print("Loaded")
+
+    connection = pika.BlockingConnection(pika.ConnectionParameters("0.0.0.0"))
+    channel = connection.channel()
+    channel.queue_declare(queue="tasks", durable=True)
+
+    def task_callback(ch,method,properties,body):
+        print(properties.reply_to)
+        # print(f"RECEIVED: {body}")
+        payload = json.loads(body.decode("utf-8"))
+        data = payload["data"]
+        taskID = payload["task"]
+        taskType = payload["taskType"]
+        print("TASK", taskType)
+
+
+        if taskType == "NER":
+            out = ner_task(data)
+        elif taskType == "Sentiment":
+            out = sentiment_task(data)
+        elif taskType == "Similarity":
+            out = similarity_task(data)
 
         
+        # print(out)
+        ch.queue_declare(queue=properties.reply_to, durable=True)
+        out = json.dumps({"taskID": taskID, "data": out})
+        try:
+            stat = requests.post(f"{NEXT_URL}", out)
+            print(stat.status_code)
+        except requests.ConnectionError as  e:
+            print(e)
+
+        ch.basic_publish(exchange="amq.topic", routing_key=properties.reply_to, body=json.dumps({"status": True}))
+        print("[x] Sent to reply")
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(queue="tasks", on_message_callback=task_callback)
+
+    print("[*] Waiting for msgs. CTRL+C to exit")
+    channel.start_consuming()
 
 
 
-
-
-
-
-app.run("localhost","5000", debug=True)
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("INTERRUPTED")
+        try: 
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
